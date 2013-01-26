@@ -4,8 +4,11 @@ import backtype.storm.task.OutputCollector;
 import backtype.storm.task.TopologyContext;
 import backtype.storm.tuple.Tuple;
 import java.util.Map;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class BasicBoltExecutor implements IRichBolt {
+    public static Logger LOG = LoggerFactory.getLogger(BasicBoltExecutor.class);    
     
     private IBasicBolt _bolt;
     private transient BasicOutputCollector _collector;
@@ -26,11 +29,22 @@ public class BasicBoltExecutor implements IRichBolt {
 
     public void execute(Tuple input) {
         _collector.setContext(input);
-        _bolt.execute(input, _collector);
-        _collector.getOutputter().ack(input);
+        try {
+            _bolt.execute(input, _collector);
+            _collector.getOutputter().ack(input);
+        } catch(FailedException e) {
+            if(e instanceof ReportedFailedException) {
+                _collector.reportError(e);
+            }
+            _collector.getOutputter().fail(input);
+        }
     }
 
     public void cleanup() {
         _bolt.cleanup();
+    }
+
+    public Map<String, Object> getComponentConfiguration() {
+        return _bolt.getComponentConfiguration();
     }
 }

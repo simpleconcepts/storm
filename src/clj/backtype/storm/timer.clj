@@ -2,8 +2,7 @@
   (:import [backtype.storm.utils Time])
   (:import [java.util PriorityQueue Comparator])
   (:import [java.util.concurrent Semaphore])
-  (:use [backtype.storm util])
-  (:use [clojure.contrib.def :only [defnk]])
+  (:use [backtype.storm util log])
   )
 
 ;; The timer defined in this file is very similar to java.util.Timer, except it integrates with
@@ -25,25 +24,25 @@
                       (fn []
                         (while @active
                           (try
-                            (let [[time-secs _ _ :as elem] (.peek queue)]
-                              (if elem
-                                (if (>= (current-time-secs) time-secs)
-                                  (locking lock
-                                    ((second (.poll queue))))
-                                  (Time/sleepUntil (to-millis time-secs))
-                                  )
-                                (Time/sleep 10000)
+                            (let [[time-secs _ _ :as elem] (locking lock (.peek queue))]
+                              (if (and elem (>= (current-time-secs) time-secs))
+                                ;; imperative to not run the function inside the timer lock
+                                ;; otherwise, it's possible to deadlock if function deals with other locks
+                                ;; (like the submit lock)
+                                (let [afn (locking lock (second (.poll queue)))]
+                                  (afn))
+                                (Time/sleep 1000)
                                 ))
-
-                            (catch InterruptedException e
-                              )
                             (catch Throwable t
-                              (kill-fn t)
-                              (reset! active false)
-                              (throw t)
+                              ;; because the interrupted exception can be wrapped in a runtimeexception
+                              (when-not (exception-cause? InterruptedException t)
+                                (kill-fn t)
+                                (reset! active false)
+                                (throw t))
                               )))
                         (.release notifier)))]
     (.setDaemon timer-thread true)
+    (.setPriority timer-thread Thread/MAX_PRIORITY)
     (.start timer-thread)
     {:timer-thread timer-thread
      :queue queue
@@ -55,24 +54,21 @@
   (when-not @(:active timer)
     (throw (IllegalStateException. "Timer is not active"))))
 
-(defn schedule [timer delay-secs afn]
-  (check-active! timer)
+(defnk schedule [timer delay-secs afn :check-active true]
+  (when check-active (check-active! timer))
   (let [id (uuid)
         ^PriorityQueue queue (:queue timer)]
     (locking (:lock timer)
       (.add queue [(+ (current-time-secs) delay-secs) afn id])
-      (when (= id (nth (.peek queue) 2))
-        (.interrupt ^Thread (:timer-thread timer)))
       )))
 
 (defn schedule-recurring [timer delay-secs recur-secs afn]
-  (check-active! timer)
   (schedule timer
             delay-secs
             (fn this []
               (afn)
-              (schedule timer recur-secs this)
-              )))
+              (schedule timer recur-secs this :check-active false)) ; this avoids a race condition with cancel-timer
+            ))
 
 (defn cancel-timer [timer]
   (check-active! timer)
@@ -81,5 +77,5 @@
     (.interrupt (:timer-thread timer)))
   (.acquire (:cancel-notifier timer)))
 
-(defn timer-waiting? [timer]  
+(defn timer-waiting? [timer]
   (Time/isThreadWaiting (:timer-thread timer)))

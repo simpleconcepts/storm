@@ -1,10 +1,12 @@
 (ns backtype.storm.util
   (:import [java.net InetAddress])
-  (:import [java.util Map List Collection])
+  (:import [java.util Map Map$Entry List ArrayList Collection Iterator HashMap])
   (:import [java.io FileReader])
   (:import [backtype.storm Config])
-  (:import [backtype.storm.utils Time Container ClojureTimerTask])
-  (:import [java.util UUID])
+  (:import [backtype.storm.utils Time Container ClojureTimerTask Utils
+            MutableObject MutableInt])
+  (:import [java.util UUID Random ArrayList List Collections])
+  (:import [java.util.zip ZipFile])
   (:import [java.util.concurrent.locks ReentrantReadWriteLock])
   (:import [java.util.concurrent Semaphore])
   (:import [java.io File RandomAccessFile StringWriter PrintWriter])
@@ -13,13 +15,140 @@
   (:import [org.apache.commons.io FileUtils])
   (:import [org.apache.commons.exec ExecuteException])
   (:import [org.json.simple JSONValue])
-  (:import [java.util Timer])
-  (:require [clojure.contrib [str-utils2 :as str]])
+  (:require [clojure [string :as str]])
+  (:import [clojure.lang RT])
   (:require [clojure [set :as set]])
   (:use [clojure walk])
   (:use [backtype.storm log])
-  (:use [clojure.contrib.def :only [defnk]])
   )
+
+(defmacro defalias
+  "Defines an alias for a var: a new var with the same root binding (if
+  any) and similar metadata. The metadata of the alias is its initial
+  metadata (as provided by def) merged into the metadata of the original."
+  ([name orig]
+     `(do
+        (alter-meta!
+         (if (.hasRoot (var ~orig))
+           (def ~name (.getRawRoot (var ~orig)))
+           (def ~name))
+         ;; When copying metadata, disregard {:macro false}.
+         ;; Workaround for http://www.assembla.com/spaces/clojure/tickets/273
+         #(conj (dissoc % :macro)
+                (apply dissoc (meta (var ~orig)) (remove #{:macro} (keys %)))))
+        (var ~name)))
+  ([name orig doc]
+     (list `defalias (with-meta name (assoc (meta name) :doc doc)) orig)))
+
+;; name-with-attributes by Konrad Hinsen:
+(defn name-with-attributes
+  "To be used in macro definitions.
+   Handles optional docstrings and attribute maps for a name to be defined
+   in a list of macro arguments. If the first macro argument is a string,
+   it is added as a docstring to name and removed from the macro argument
+   list. If afterwards the first macro argument is a map, its entries are
+   added to the name's metadata map and the map is removed from the
+   macro argument list. The return value is a vector containing the name
+   with its extended metadata map and the list of unprocessed macro
+   arguments."
+  [name macro-args]
+  (let [[docstring macro-args] (if (string? (first macro-args))
+                                 [(first macro-args) (next macro-args)]
+                                 [nil macro-args])
+    [attr macro-args]          (if (map? (first macro-args))
+                                 [(first macro-args) (next macro-args)]
+                                 [{} macro-args])
+    attr                       (if docstring
+                                 (assoc attr :doc docstring)
+                                 attr)
+    attr                       (if (meta name)
+                                 (conj (meta name) attr)
+                                 attr)]
+    [(with-meta name attr) macro-args]))
+
+(defmacro defnk
+ "Define a function accepting keyword arguments. Symbols up to the first
+ keyword in the parameter list are taken as positional arguments.  Then
+ an alternating sequence of keywords and defaults values is expected. The
+ values of the keyword arguments are available in the function body by
+ virtue of the symbol corresponding to the keyword (cf. :keys destructuring).
+ defnk accepts an optional docstring as well as an optional metadata map."
+ [fn-name & fn-tail]
+ (let [[fn-name [args & body]] (name-with-attributes fn-name fn-tail)
+       [pos kw-vals]           (split-with symbol? args)
+       syms                    (map #(-> % name symbol) (take-nth 2 kw-vals))
+       values                  (take-nth 2 (rest kw-vals))
+       sym-vals                (apply hash-map (interleave syms values))
+       de-map                  {:keys (vec syms)
+                                :or   sym-vals}]
+   `(defn ~fn-name
+      [~@pos & options#]
+      (let [~de-map (apply hash-map options#)]
+        ~@body))))
+
+(defn find-first
+  "Returns the first item of coll for which (pred item) returns logical true.
+  Consumes sequences up to the first match, will consume the entire sequence
+  and return nil if no match is found."
+  [pred coll]
+  (first (filter pred coll)))
+
+(defn dissoc-in
+  "Dissociates an entry from a nested associative structure returning a new
+  nested structure. keys is a sequence of keys. Any empty maps that result
+  will not be present in the new structure."
+  [m [k & ks :as keys]]
+  (if ks
+    (if-let [nextmap (get m k)]
+      (let [newmap (dissoc-in nextmap ks)]
+        (if (seq newmap)
+          (assoc m k newmap)
+          (dissoc m k)))
+      m)
+    (dissoc m k)))
+
+(defn indexed
+  "Returns a lazy sequence of [index, item] pairs, where items come
+  from 's' and indexes count up from zero.
+
+  (indexed '(a b c d))  =>  ([0 a] [1 b] [2 c] [3 d])"
+  [s]
+  (map vector (iterate inc 0) s))
+
+(defn positions
+  "Returns a lazy sequence containing the positions at which pred
+   is true for items in coll."
+  [pred coll]
+  (for [[idx elt] (indexed coll) :when (pred elt)] idx))
+
+(defn exception-cause? [klass ^Throwable t]
+  (->> (iterate #(.getCause ^Throwable %) t)
+       (take-while identity)
+       (some (partial instance? klass))
+       boolean))
+
+(defmacro forcat [[args aseq] & body]
+  `(mapcat (fn [~args]
+             ~@body)
+           ~aseq))
+
+(defmacro try-cause [& body]
+  (let [checker (fn [form]
+                  (or (not (sequential? form))
+                      (not= 'catch (first form))))
+        [code guards] (split-with checker body)
+        error-local (gensym "t")
+        guards (forcat [[_ klass local & guard-body] guards]
+                 `((exception-cause? ~klass ~error-local)
+                   (let [~local ~error-local]
+                     ~@guard-body
+                     )))
+        ]
+    `(try ~@code
+          (catch Throwable ~error-local
+            (cond ~@guards
+                  true (throw ~error-local)
+                  )))))
 
 (defn local-hostname []
   (.getCanonicalHostName (InetAddress/getLocalHost)))
@@ -39,7 +168,7 @@
   (str (UUID/randomUUID)))
 
 (defn current-time-secs []
-  (int (unchecked-divide (Time/currentTimeMillis) (long 1000))))
+  (Time/currentTimeSecs))
 
 (defn clojurify-structure [s]
   (prewalk (fn [x]
@@ -101,20 +230,35 @@
        amap
        )))
 
+(defn filter-key [afn amap]
+  (into {}
+    (filter
+      (fn [[k v]]
+        (afn k))
+       amap
+       )))
+
+(defn map-key [afn amap]
+  (into {}
+    (for [[k v] amap]
+      [(afn k) v]
+      )))
+
+(defn separate [pred aseq]
+  [(filter pred aseq) (filter (complement pred) aseq)])
+
 (defn full-path [parent name]
   (let [toks (tokenize-path parent)]
     (toks->path (conj toks name))
     ))
 
-(defn not-nil? [o]
-  (not (nil? o)))
+(def not-nil? (complement nil?))
 
 (defn barr [& vals]
   (byte-array (map byte vals)))
 
 (defn halt-process! [val & msg]
   (log-message "Halting process: " msg)
-  (Thread/sleep 1000)
   (.halt (Runtime/getRuntime) val)
   )
 
@@ -181,23 +325,24 @@
     ))
 
 (defn extract-dir-from-jar [jarpath dir destdir]
-  (try
+  (try-cause
     (exec-command! (str "unzip -qq " jarpath " " dir "/** -d " destdir))
   (catch ExecuteException e
-    (log-message "Error when trying to extract " dir " from " jarpath))
+    (log-message "Could not extract " dir " from " jarpath))
   ))
 
 (defn ensure-process-killed! [pid]
   ;; TODO: should probably do a ps ax of some sort to make sure it was killed
-  (try
+  (try-cause
     (exec-command! (str "kill -9 " pid))
   (catch ExecuteException e
     (log-message "Error when trying to kill " pid ". Process is probably already dead."))
     ))
 
 (defnk launch-process [command :environment {}]
-  (let [command (seq (.split command " "))
-        builder (ProcessBuilder. (cons "nohup" command))
+  (let [command (->> (seq (.split command " "))
+                     (filter (complement empty?)))
+        builder (ProcessBuilder. command)
         process-env (.environment builder)]
     (doseq [[k v] environment]
       (.put process-env k v))
@@ -205,7 +350,8 @@
     ))
 
 (defn sleep-secs [secs]
-  (Time/sleep (* (long secs) 1000)))
+  (when (pos? secs)
+    (Time/sleep (* (long secs) 1000))))
 
 (defn sleep-until-secs [target-secs]
   (Time/sleepUntil (* (long target-secs) 1000)))
@@ -221,14 +367,14 @@
                    :daemon false
                    :kill-fn (fn [error] (halt-process! 1 "Async loop died!"))
                    :priority Thread/NORM_PRIORITY
-                   :args-fn (fn [] [])
+                   :factory? false
                    :start true]
   (let [thread (Thread.
                 (fn []
-                  (try
-                    (let [args (args-fn)]
+                  (try-cause
+                    (let [afn (if factory? (afn) afn)]
                       (loop []
-                        (let [sleep-time (apply afn args)]
+                        (let [sleep-time (afn)]
                           (when-not (nil? sleep-time)
                             (sleep-secs sleep-time)
                             (recur))
@@ -237,13 +383,8 @@
                       (log-message "Async loop interrupted!")
                       )
                     (catch Throwable t
-                      ;; work around clojure wrapping exceptions
-                      (if (instance? InterruptedException (.getCause t))
-                        (log-message "Async loop interrupted!")
-                        (do
-                          (log-error t "Async loop died!")
-                          (kill-fn t)
-                          ))
+                      (log-error t "Async loop died!")
+                      (kill-fn t)
                       ))
                   ))]
     (.setDaemon thread daemon)
@@ -263,9 +404,6 @@
         ))
       ))
 
-(defn filter-map-val [afn amap]
-  (into {} (filter (fn [[k v]] (afn v)) amap)))
-
 (defn exists-file? [path]
   (.exists (File. path)))
 
@@ -278,10 +416,11 @@
   "Removes file or directory at the path. Not recursive. Throws exception on failure"
   [path]
   (log-debug "Removing path " path)
-  (let [deleted? (.delete (File. path))]
-    (when-not deleted?
-      (throw (RuntimeException. (str "Failed to delete " path))))
-    ))
+  (when (exists-file? path)
+    (let [deleted? (.delete (File. path))]
+      (when-not deleted?
+        (throw (RuntimeException. (str "Failed to delete " path))))
+      )))
 
 (defn local-mkdirs
   [path]
@@ -314,18 +453,18 @@
   (ReentrantReadWriteLock.))
 
 (defmacro read-locked [rw-lock & body]
-  `(let [rlock# (.readLock ~rw-lock)]
-      (try
-        (.lock rlock#)
-        ~@body
-      (finally (.unlock rlock#)))))
+  (let [lock (with-meta rw-lock {:tag `ReentrantReadWriteLock})]
+    `(let [rlock# (.readLock ~lock)]
+       (try (.lock rlock#)
+            ~@body
+            (finally (.unlock rlock#))))))
 
 (defmacro write-locked [rw-lock & body]
-  `(let [wlock# (.writeLock ~rw-lock)]
-      (try
-        (.lock wlock#)
-        ~@body
-      (finally (.unlock wlock#)))))
+  (let [lock (with-meta rw-lock {:tag `ReentrantReadWriteLock})]
+    `(let [wlock# (.writeLock ~lock)]
+       (try (.lock wlock#)
+            ~@body
+            (finally (.unlock wlock#))))))
 
 (defn wait-for-condition [apredicate]
   (while (not (apredicate))
@@ -339,29 +478,26 @@
   (- (current-time-secs) time-secs))
 
 (defn time-delta-ms [time-ms]
-  (- (System/currentTimeMillis) time-ms))
+  (- (System/currentTimeMillis) (long time-ms)))
 
 (defn parse-int [str]
-  (Integer/parseInt str))
+  (Integer/valueOf str))
 
 (defn integer-divided [sum num-pieces]
-  (let [base (int (/ sum num-pieces))
-        num-inc (mod sum num-pieces)
-        num-bases (- num-pieces num-inc)]
-    (if (= num-inc 0)
-      {base num-bases}
-      {base num-bases (inc base) num-inc}
-      )))
+  (clojurify-structure (Utils/integerDivided sum num-pieces)))
 
 (defn collectify [obj]
   (if (or (sequential? obj) (instance? Collection obj)) obj [obj]))
 
-(defn to-json [^Map m]
-  (JSONValue/toJSONString m))
+(defn to-json [obj]
+  (JSONValue/toJSONString obj))
 
 (defn from-json [^String str]
-  (clojurify-structure
-    (JSONValue/parse str)))
+  (if str
+    (clojurify-structure
+     (JSONValue/parse str))
+    nil
+    ))
 
 (defmacro letlocals [& body]
    (let [[tobind lexpr] (split-at (dec (count body)) body)
@@ -381,6 +517,9 @@
       (throw (IllegalArgumentException. "Nothing to remove")))
     (concat b (rest e))
     ))
+
+(defn assoc-non-nil [m k v]
+  (if v (assoc m k v) m))
 
 (defn multi-set
   "Returns a map of elem to count"
@@ -428,21 +567,17 @@
          amap)))
 
 
-(defn rotating-random-range [amt]
-  (ref (shuffle (range amt))))
+(defn rotating-random-range [choices]
+  (let [rand (Random.)
+        choices (ArrayList. choices)]
+    (Collections/shuffle choices rand)
+    [(MutableInt. -1) choices rand]))
 
-(defn acquire-random-range-id [rr amt]
-  (dosync
-   (let [ret (first @rr)]
-     (alter
-      rr
-      (fn [rr]
-        (if (= 1 (count rr))
-          (shuffle (range amt))
-          (next rr))
-        ))
-     ret
-     )))
+(defn acquire-random-range-id [[^MutableInt curr ^List state ^Random rand]]
+  (when (>= (.increment curr) (.size state))
+    (.set curr 0)
+    (Collections/shuffle state rand))
+  (.get state (.get curr)))
 
 ; this can be rewritten to be tail recursive
 (defn interleave-all [& colls]
@@ -470,9 +605,10 @@
        (<= val upper)))
 
 (defmacro benchmark [& body]
-  `(time
-    (doseq [i# (range 1000000)]
-      ~@body)))
+  `(let [l# (doall (range 1000000))]
+     (time
+       (doseq [i# l#]
+         ~@body))))
 
 (defn rand-sampler [freq]
   (let [r (java.util.Random.)]
@@ -481,19 +617,18 @@
     ))
 
 (defn even-sampler [freq]
-  (let [r (java.util.Random.)
-        state (atom [-1 (.nextInt r freq)])
-        updater (fn [[i target]]
-                  (let [i (inc i)]
-                    (if (>= i freq)
-                      [0 (.nextInt r freq)]
-                      [i target]
-                      )))]
+  (let [freq (int freq)
+        start (int 0)
+        r (java.util.Random.)
+        curr (MutableInt. -1)
+        target (MutableInt. (.nextInt r freq))]
     (with-meta
       (fn []
-        (let [[i target] (swap! state updater)]
-          (= i target)
-          ))
+        (let [i (.increment curr)]
+          (when (>= i freq)
+            (.set curr start)
+            (.set target (.nextInt r freq))))
+          (= (.get curr) (.get target)))
       {:rate freq})))
 
 (defn sampler-rate [sampler]
@@ -515,7 +650,7 @@
     ))
 
 (defn nil-to-zero [v]
-  (if v v 0))
+  (or v 0))
 
 (defn bit-xor-vals [vals]
   (reduce bit-xor 0 vals))
@@ -540,31 +675,151 @@
 (defn throw-runtime [& strs]
   (throw (RuntimeException. (apply str strs))))
 
-(defn exception-cause? [klass ^Throwable t]
-  (->> (iterate #(.getCause ^Throwable %) t)
-       (take-while identity)
-       (some (partial instance? klass))
-       boolean))
+(defn redirect-stdio-to-slf4j! []
+  ;; set-var-root doesn't work with *out* and *err*, so digging much deeper here
+  ;; Unfortunately, this code seems to work at the REPL but not when spawned as worker processes
+  ;; it might have something to do with being a child process
+  ;; (set! (. (.getThreadBinding RT/OUT) val)
+  ;;       (java.io.OutputStreamWriter.
+  ;;         (log-stream :info "STDIO")))
+  ;; (set! (. (.getThreadBinding RT/ERR) val)
+  ;;       (PrintWriter.
+  ;;         (java.io.OutputStreamWriter.
+  ;;           (log-stream :error "STDIO"))
+  ;;         true))
+  (log-capture! "STDIO"))
 
-(defmacro forcat [[args aseq] & body]
-  `(mapcat (fn [~args]
-             ~@body)
-           ~aseq))
+(defn spy [prefix val]
+  (log-message prefix ": " val)
+  val)
 
-(defmacro try-cause [& body]
-  (let [checker (fn [form]
-                  (or (not (sequential? form))
-                      (not= 'catch (first form))))
-        [code guards] (split-with checker body)
-        error-local (gensym "t")
-        guards (forcat [[_ klass local & guard-body] guards]
-                 `((exception-cause? ~klass ~error-local)
-                   (let [~local ~error-local]
-                     ~@guard-body
-                     )))
-        ]
-    `(try ~@code
-          (catch Throwable ~error-local
-            (cond ~@guards
-                  true (throw ~error-local)
-                  )))))
+(defn zip-contains-dir? [zipfile target]
+  (let [entries (->> zipfile (ZipFile.) .entries enumeration-seq (map (memfn getName)))]
+    (some? #(.startsWith % (str target "/")) entries)
+    ))
+
+(defn url-encode [s]
+  (java.net.URLEncoder/encode s))
+
+(defn join-maps [& maps]
+  (let [all-keys (apply set/union (for [m maps] (-> m keys set)))]
+    (into {}
+      (for [k all-keys]
+        [k (for [m maps] (m k))]
+        ))))
+
+(defn partition-fixed [max-num-chunks aseq]
+  (if (zero? max-num-chunks)
+    []
+    (let [chunks (->> (integer-divided (count aseq) max-num-chunks)
+                      (#(dissoc % 0))
+                      (sort-by (comp - first))
+                      (mapcat (fn [[size amt]] (repeat amt size)))
+                      )]
+      (loop [result []
+             [chunk & rest-chunks] chunks
+             data aseq]
+        (if (nil? chunk)
+          result
+          (let [[c rest-data] (split-at chunk data)]
+            (recur (conj result c)
+                   rest-chunks
+                   rest-data)))))))
+
+
+(defn assoc-apply-self [curr key afn]
+  (assoc curr key (afn curr)))
+
+(defmacro recursive-map [& forms]
+  (->> (partition 2 forms)
+       (map (fn [[key form]] `(assoc-apply-self ~key (fn [~'<>] ~form))))
+       (concat `(-> {}))))
+
+(defn current-stack-trace []
+  (->> (Thread/currentThread)
+       .getStackTrace
+       (map str)
+       (str/join "\n")
+       ))
+
+(defn get-iterator [^Iterable alist]
+  (if alist (.iterator alist)))
+
+(defn iter-has-next? [^Iterator iter]
+  (if iter (.hasNext iter) false))
+
+(defn iter-next [^Iterator iter]
+  (.next iter))
+
+(defmacro fast-list-iter [pairs & body]
+  (let [pairs (partition 2 pairs)
+        lists (map second pairs)
+        elems (map first pairs)
+        iters (map (fn [_] (gensym)) lists)
+        bindings (->> (map (fn [i l] [i `(get-iterator ~l)]) iters lists) (apply concat))
+        tests (map (fn [i] `(iter-has-next? ~i)) iters)
+        assignments (->> (map (fn [e i] [e `(iter-next ~i)]) elems iters) (apply concat))]
+    `(let [~@bindings]
+       (while (and ~@tests)
+         (let [~@assignments]
+           ~@body
+           )))))
+
+(defn fast-list-map [afn alist]
+  (let [ret (ArrayList.)]
+    (fast-list-iter [e alist]
+      (.add ret (afn e)))
+    ret ))
+
+(defmacro fast-list-for [[e alist] & body]
+  `(fast-list-map (fn [~e] ~@body) ~alist))
+
+(defn map-iter [^Map amap]
+  (if amap (-> amap .entrySet .iterator)))
+
+(defn convert-entry [^Map$Entry entry]
+  [(.getKey entry) (.getValue entry)])
+
+(defmacro fast-map-iter [[bind amap] & body]
+  `(let [iter# (map-iter ~amap)]
+    (while (iter-has-next? iter#)
+      (let [entry# (iter-next iter#)
+            ~bind (convert-entry entry#)]
+        ~@body
+        ))))
+
+(defn fast-first [^List alist]
+  (.get alist 0))
+
+(defmacro get-with-default [amap key default-val]
+  `(let [curr# (.get ~amap ~key)]
+     (if curr#
+       curr#
+       (do
+         (let [new# ~default-val]
+           (.put ~amap ~key new#)
+           new#
+           )))))
+
+(defn fast-group-by [afn alist]
+  (let [ret (HashMap.)]
+    (fast-list-iter [e alist]
+      (let [key (afn e)
+            ^List curr (get-with-default ret key (ArrayList.))]
+        (.add curr e)))
+    ret ))
+
+(defn new-instance [klass]
+  (let [klass (if (string? klass) (Class/forName klass) klass)]
+    (.newInstance klass)
+    ))
+
+(defmacro -<>
+  ([x] x)
+  ([x form] (if (seq? form)
+              (with-meta
+                (let [[begin [_ & end]] (split-with #(not= % '<>) form)]
+                  (concat begin [x] end))
+                (meta form))
+              (list form x)))
+  ([x form & more] `(-<> (-<> ~x ~form) ~@more)))
