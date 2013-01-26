@@ -1,16 +1,15 @@
 (ns backtype.storm.ui.helpers
   (:use compojure.core)
   (:use [hiccup core page-helpers])
-  (:use [clojure.contrib
-         [str-utils2 :only [join]]
-         [def :only [defnk]]])
-  (:use [backtype.storm.util :only [uuid]])
+  (:use [clojure [string :only [join]]])
+  (:use [backtype.storm.util :only [uuid defnk]])
   (:use [clj-time coerce format])
+  (:import [backtype.storm.generated ExecutorInfo ExecutorSummary])
   (:require [compojure.route :as route]
             [compojure.handler :as handler]))
 
 (defn split-divide [val divider]
-  [(int (/ val divider)) (mod val divider)]
+  [(Integer. (int (/ val divider))) (mod val divider)]
   )
 
 (def PRETTY-SEC-DIVIDERS
@@ -113,3 +112,23 @@ $(\"table#%s\").each(function(i) { $(this).tablesorter({ sortList: %s, headers: 
   (let [dt (from-long (* 1000 (long secs)))]
     (unparse (:rfc822 formatters) dt)
     ))
+
+(defn url-format [fmt & args]
+  (String/format fmt 
+    (to-array (map #(java.net.URLEncoder/encode (str %)) args))))
+
+(defn to-tasks [^ExecutorInfo e]
+  (let [start (.get_task_start e)
+        end (.get_task_end e)]
+    (range start (inc end))
+    ))
+
+(defn sum-tasks [executors]
+  (reduce + (->> executors
+                 (map #(.get_executor_info ^ExecutorSummary %))
+                 (map to-tasks)
+                 (map count))))
+
+(defn pretty-executor-info [^ExecutorInfo e]
+  (str "[" (.get_task_start e) "-" (.get_task_end e) "]"))
+

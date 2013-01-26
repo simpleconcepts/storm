@@ -3,15 +3,20 @@
   )
 
 (defprotocol Connection
-  (recv [conn])
+  (recv-with-flags [conn flags])
   (send [conn task message])
   (close [conn])
   )
 
 (defprotocol Context
-  (bind [context virtual-port])
-  (connect [context host port])
-  (send-local-task-empty [context virtual-port])
+  (bind [context storm-id port])
+  (connect [context storm-id host port])
   (term [context])
   )
+
+(defn recv [conn]
+  (recv-with-flags conn 0))
+
+;; (defn send [conn task message]
+;;   (send-with-flags conn task message 1)) ;; NOBLOCK
 

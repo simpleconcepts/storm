@@ -1,24 +1,25 @@
 package backtype.storm.task;
 
-import backtype.storm.generated.Bolt;
-import backtype.storm.generated.ComponentCommon;
 import backtype.storm.generated.GlobalStreamId;
 import backtype.storm.generated.Grouping;
-import backtype.storm.generated.SpoutSpec;
-import backtype.storm.generated.StateSpoutSpec;
 import backtype.storm.generated.StormTopology;
-import backtype.storm.generated.StreamInfo;
+import backtype.storm.hooks.ITaskHook;
+import backtype.storm.metric.api.IMetric;
+import backtype.storm.metric.api.IReducer;
+import backtype.storm.metric.api.ICombiner;
+import backtype.storm.metric.api.ReducedMetric;
+import backtype.storm.metric.api.CombinedMetric;
 import backtype.storm.state.ISubscribedState;
 import backtype.storm.tuple.Fields;
 import backtype.storm.utils.Utils;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import org.apache.commons.lang.NotImplementedException;
-import org.json.simple.JSONValue;
 
 /**
  * A TopologyContext is given to bolts and spouts in their "prepare" and "open"
@@ -28,30 +29,29 @@ import org.json.simple.JSONValue;
  * <p>The TopologyContext is also used to declare ISubscribedState objects to
  * synchronize state with StateSpouts this object is subscribed to.</p>
  */
-public class TopologyContext {
-    private StormTopology _topology;
-    private Map<Integer, String> _taskToComponent;
+public class TopologyContext extends WorkerTopologyContext implements IMetricsContext {
     private Integer _taskId;
-    private Map<String, List<Integer>> _componentToTasks;
-    private String _codeDir;
-    private String _pidDir;
-    private String _stormId;
+    private Map<String, Object> _taskData = new HashMap<String, Object>();
+    private List<ITaskHook> _hooks = new ArrayList<ITaskHook>();
+    private Map<String, Object> _executorData;
+    private Map<Integer,Map<Integer, Map<String, IMetric>>> _registeredMetrics;
+    private clojure.lang.Atom _openOrPrepareWasCalled;
 
-    public TopologyContext(StormTopology topology, Map<Integer, String> taskToComponent, String stormId, String codeDir, String pidDir, Integer taskId) {
-        _topology = topology;
-        _taskToComponent = taskToComponent;
-        _stormId = stormId;
+    
+    public TopologyContext(StormTopology topology, Map stormConf,
+            Map<Integer, String> taskToComponent, Map<String, List<Integer>> componentToSortedTasks,
+            Map<String, Map<String, Fields>> componentToStreamToFields,
+            String stormId, String codeDir, String pidDir, Integer taskId,
+            Integer workerPort, List<Integer> workerTasks, Map<String, Object> defaultResources,
+            Map<String, Object> userResources, Map<String, Object> executorData, Map registeredMetrics,
+            clojure.lang.Atom openOrPrepareWasCalled) {
+        super(topology, stormConf, taskToComponent, componentToSortedTasks,
+                componentToStreamToFields, stormId, codeDir, pidDir,
+                workerPort, workerTasks, defaultResources, userResources);
         _taskId = taskId;
-        _componentToTasks = new HashMap<String, List<Integer>>();
-        _pidDir = pidDir;
-        _codeDir = codeDir;
-        for(Integer task: taskToComponent.keySet()) {
-            String component = taskToComponent.get(task);
-            List<Integer> curr = _componentToTasks.get(component);
-            if(curr==null) curr = new ArrayList<Integer>();
-            curr.add(task);
-            _componentToTasks.put(component, curr);
-        }
+        _executorData = executorData;
+        _registeredMetrics = registeredMetrics;
+        _openOrPrepareWasCalled = openOrPrepareWasCalled;
     }
 
     /**
@@ -110,41 +110,12 @@ public class TopologyContext {
     }
 
     /**
-     * Gets the unique id assigned to this topology. The id is the storm name with a
-     * unique nonce appended to it.
-     * @return the storm id
-     */
-    public String getStormId() {
-        return _stormId;
-    }
-
-    /**
      * Gets the task id of this task.
      * 
      * @return the task id
      */
     public int getThisTaskId() {
         return _taskId;
-    }
-
-    /**
-     * Gets the Thrift object representing the topology.
-     * 
-     * @return the Thrift definition representing the topology
-     */
-    public StormTopology getRawTopology() {
-        return _topology;
-    }
-
-    /**
-     * Gets the component id for the specified task id. The component id maps
-     * to a component id specified for a Spout or Bolt in the topology definition.
-     *
-     * @param taskId the task id
-     * @return the component id for the input task id
-     */
-    public String getComponentId(int taskId) {
-        return _taskToComponent.get(taskId);
     }
 
     /**
@@ -172,23 +143,6 @@ public class TopologyContext {
     }
 
     /**
-     * Gets the set of streams declared for the specified component.
-     */
-    public Set<String> getComponentStreams(String componentId) {
-        return getComponentCommon(componentId).get_streams().keySet();
-    }
-
-    /**
-     * Gets the task ids allocated for the given component id. The task ids are
-     * always returned in ascending order.
-     */
-    public List<Integer> getComponentTasks(String componentId) {
-        List<Integer> ret = _componentToTasks.get(componentId);
-        if(ret==null) return new ArrayList<Integer>();
-        else return new ArrayList<Integer>(ret);
-    }
-
-    /**
      * Gets the index of this task id in getComponentTasks(getThisComponentId()).
      * An example use case for this method is determining which task
      * accesses which resource in a distributed resource to ensure an even distribution.
@@ -203,24 +157,6 @@ public class TopologyContext {
         }
         throw new RuntimeException("Fatal: could not find this task id in this component");
     }
-
-    /**
-     * Gets the declared output fields for the specified component/stream.
-     */
-    public Fields getComponentOutputFields(String componentId, String streamId) {
-        StreamInfo streamInfo = getComponentCommon(componentId).get_streams().get(streamId);
-        if(streamInfo==null) {
-            throw new IllegalArgumentException("No output fields defined for component:stream " + componentId + ":" + streamId);
-        }
-        return new Fields(streamInfo.get_output_fields());
-    }
-
-    /**
-     * Gets the declared output fields for the specified global stream id.
-     */
-    public Fields getComponentOutputFields(GlobalStreamId id) {
-        return getComponentOutputFields(id.get_componentId(), id.get_streamId());
-    }    
     
     /**
      * Gets the declared inputs to this component.
@@ -229,17 +165,6 @@ public class TopologyContext {
      */
     public Map<GlobalStreamId, Grouping> getThisSources() {
         return getSources(getThisComponentId());
-    }
-    
-    /**
-     * Gets the declared inputs to the specified component.
-     *
-     * @return A map from subscribed component/stream to the grouping subscribed with.
-     */
-    public Map<GlobalStreamId, Grouping> getSources(String componentId) {
-        Bolt bolt = _topology.get_bolts().get(componentId);
-        if(bolt==null) return null;
-        return bolt.get_inputs();
     }
 
     /**
@@ -250,76 +175,75 @@ public class TopologyContext {
     public Map<String, Map<String, Grouping>> getThisTargets() {
         return getTargets(getThisComponentId());
     }
+    
+    public void setTaskData(String name, Object data) {
+        _taskData.put(name, data);
+    }
+    
+    public Object getTaskData(String name) {
+        return _taskData.get(name);
+    }
 
-    /**
-     * Gets information about who is consuming the outputs of the specified component,
-     * and how.
-     *
-     * @return Map from stream id to component id to the Grouping used.
+    public void setExecutorData(String name, Object data) {
+        _executorData.put(name, data);
+    }
+    
+    public Object getExecutorData(String name) {
+        return _executorData.get(name);
+    }    
+    
+    public void addTaskHook(ITaskHook hook) {
+        hook.prepare(_stormConf, this);
+        _hooks.add(hook);
+    }
+    
+    public Collection<ITaskHook> getHooks() {
+        return _hooks;
+    }
+
+    /*
+     * Register a IMetric instance. 
+     * Storm will then call getValueAndReset on the metric every timeBucketSizeInSecs
+     * and the returned value is sent to all metrics consumers.
+     * You must call this during IBolt::prepare or ISpout::open.
+     * @return The IMetric argument unchanged.
      */
-    public Map<String, Map<String, Grouping>> getTargets(String componentId) {
-        Map<String, Map<String, Grouping>> ret = new HashMap<String, Map<String, Grouping>>();
-        for(String otherComponentId: _topology.get_bolts().keySet()) {
-            Bolt bolt = _topology.get_bolts().get(otherComponentId);
-            for(GlobalStreamId id: bolt.get_inputs().keySet()) {
-                if(id.get_componentId().equals(componentId)) {
-                    Map<String, Grouping> curr = ret.get(id.get_streamId());
-                    if(curr==null) curr = new HashMap<String, Grouping>();
-                    curr.put(otherComponentId, bolt.get_inputs().get(id));
-                    ret.put(id.get_streamId(), curr);
-                }
-            }
+    public <T extends IMetric> T registerMetric(String name, T metric, int timeBucketSizeInSecs) {
+        if((Boolean)_openOrPrepareWasCalled.deref() == true) {
+            throw new RuntimeException("TopologyContext.registerMetric can only be called from within overridden " + 
+                                       "IBolt::prepare() or ISpout::open() method.");
         }
-        return ret;
+        
+        Map m1 = _registeredMetrics;
+        if(!m1.containsKey(timeBucketSizeInSecs)) {
+            m1.put(timeBucketSizeInSecs, new HashMap());
+        }
+
+        Map m2 = (Map)m1.get(timeBucketSizeInSecs);
+        if(!m2.containsKey(_taskId)) {
+            m2.put(_taskId, new HashMap());
+        }
+
+        Map m3 = (Map)m2.get(_taskId);
+        if(m3.containsKey(name)) {
+            throw new RuntimeException("The same metric name `" + name + "` was registered twice." );
+        } else {
+            m3.put(name, metric);
+        }
+
+        return metric;
     }
 
-    public String toJSONString() {
-        Map obj = new HashMap();
-        obj.put("taskid", _taskId);
-        obj.put("task->component", _taskToComponent);
-        // TODO: jsonify StormTopology
-        // at the minimum should send source info
-        return JSONValue.toJSONString(obj);
-    }
-
-    private ComponentCommon getComponentCommon(String componentId) {
-       Bolt bolt =  _topology.get_bolts().get(componentId);
-       if(bolt!=null) {
-           return bolt.get_common();
-       }
-       SpoutSpec spoutSpec = _topology.get_spouts().get(componentId);
-       if(spoutSpec!=null) {
-           return spoutSpec.get_common();
-       }
-       StateSpoutSpec stateSpoutSpec = _topology.get_state_spouts().get(componentId);
-       if(stateSpoutSpec!=null) {
-           return stateSpoutSpec.get_common();
-       }
-       throw new IllegalArgumentException("Could not find component common for " + componentId);
-    }
-
-    /**
-     * Gets the location of the external resources for this worker on the
-     * local filesystem. These external resources typically include bolts implemented
-     * in other languages, such as Ruby or Python.
+    /*
+     * Convinience method for registering ReducedMetric.
      */
-    public String getCodeDir() {
-        return _codeDir;
+    public ReducedMetric registerMetric(String name, IReducer reducer, int timeBucketSizeInSecs) {
+        return registerMetric(name, new ReducedMetric(reducer), timeBucketSizeInSecs);
     }
-
-    /**
-     * If this task spawns any subprocesses, those subprocesses must immediately
-     * write their PID to this directory on the local filesystem to ensure that
-     * Storm properly destroys that process when the worker is shutdown.
+    /*
+     * Convinience method for registering CombinedMetric.
      */
-    public String getPIDDir() {
-        return _pidDir;
-    }
-
-    /**
-     * Gets a map from task id to component id.
-     */
-    public Map<Integer, String> getTaskToComponent() {
-        return _taskToComponent;
+    public CombinedMetric registerMetric(String name, ICombiner combiner, int timeBucketSizeInSecs) {
+        return registerMetric(name, new CombinedMetric(combiner), timeBucketSizeInSecs);
     }
 }

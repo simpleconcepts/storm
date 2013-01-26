@@ -1,7 +1,6 @@
 package backtype.storm.utils;
 
 import backtype.storm.generated.DRPCExecutionException;
-import backtype.storm.generated.DRPCRequest;
 import backtype.storm.generated.DistributedRPC;
 import org.apache.thrift7.TException;
 import org.apache.thrift7.protocol.TBinaryProtocol;
@@ -13,20 +12,30 @@ public class DRPCClient implements DistributedRPC.Iface {
     private TTransport conn;
     private DistributedRPC.Client client;
     private String host;
-    private int port;    
+    private int port;
+    private Integer timeout;
 
-    public DRPCClient(String host, int port) {
+    public DRPCClient(String host, int port, Integer timeout) {
         try {
             this.host = host;
             this.port = port;
+            this.timeout = timeout;
             connect();
         } catch(TException e) {
             throw new RuntimeException(e);
         }
     }
     
+    public DRPCClient(String host, int port) {
+        this(host, port, null);
+    }
+    
     private void connect() throws TException {
-        conn = new TFramedTransport(new TSocket(host, port));
+        TSocket socket = new TSocket(host, port);
+        if(timeout!=null) {
+            socket.setTimeout(timeout);
+        }
+        conn = new TFramedTransport(socket);
         client = new DistributedRPC.Client(new TBinaryProtocol(conn));
         conn.open();
     }
@@ -47,36 +56,6 @@ public class DRPCClient implements DistributedRPC.Iface {
             client = null;
             throw e;
         } catch(DRPCExecutionException e) {
-            client = null;
-            throw e;
-        }
-    }
-
-    public void result(String id, String result) throws TException {
-        try {
-            if(client==null) connect();
-            client.result(id, result);
-        } catch(TException e) {
-            client = null;
-            throw e;
-        }
-    }
-
-    public DRPCRequest fetchRequest(String func) throws TException {
-        try {
-            if(client==null) connect();
-            return client.fetchRequest(func);
-        } catch(TException e) {
-            client = null;
-            throw e;
-        }
-    }    
-
-    public void failRequest(String id) throws TException {
-        try {
-            if(client==null) connect();
-            client.failRequest(id);
-        } catch(TException e) {
             client = null;
             throw e;
         }

@@ -3,8 +3,10 @@
   (:import [org.apache.thrift7.protocol TBinaryProtocol TBinaryProtocol$Factory])
   (:import [org.apache.thrift7 TException])
   (:import [org.apache.thrift7.transport TNonblockingServerTransport TNonblockingServerSocket])
-  (:import [backtype.storm.generated DistributedRPC DistributedRPC$Iface DistributedRPC$Processor DRPCRequest DRPCExecutionException])
-  (:import [java.util.concurrent Semaphore ConcurrentLinkedQueue])
+  (:import [backtype.storm.generated DistributedRPC DistributedRPC$Iface DistributedRPC$Processor
+            DRPCRequest DRPCExecutionException DistributedRPCInvocations DistributedRPCInvocations$Iface
+            DistributedRPCInvocations$Processor])
+  (:import [java.util.concurrent Semaphore ConcurrentLinkedQueue ThreadPoolExecutor ArrayBlockingQueue TimeUnit])
   (:import [backtype.storm.daemon Shutdownable])
   (:import [java.net InetAddress])
   (:use [backtype.storm bootstrap config log])
@@ -12,8 +14,6 @@
 
 (bootstrap)
 
-;; TODO: timeout should be configurable on a per-function basis
-(def REQUEST-TIMEOUT-SECS 60)
 (def TIMEOUT-CHECK-SECS 5)
 
 (defn acquire-queue [queues-atom function]
@@ -27,7 +27,8 @@
 
 ;; TODO: change this to use TimeCacheMap
 (defn service-handler []
-  (let [ctr (atom 0)
+  (let [conf (read-storm-config)
+        ctr (atom 0)
         id->sem (atom {})
         id->result (atom {})
         id->start (atom {})
@@ -39,7 +40,7 @@
         clear-thread (async-loop
                       (fn []
                         (doseq [[id start] @id->start]
-                          (when (> (time-delta start) REQUEST-TIMEOUT-SECS)
+                          (when (> (time-delta start) (conf DRPC-REQUEST-TIMEOUT-SECS))
                             (when-let [sem (@id->sem id)]
                               (swap! id->result assoc id (DRPCExecutionException. "Request timed out"))
                               (.release sem))
@@ -69,6 +70,7 @@
               (throw result)
               result
               ))))
+      DistributedRPCInvocations$Iface
       (^void result [this ^String id ^String result]
         (let [^Semaphore sem (@id->sem id)]
           (log-debug "Received result " result " for " id " at " (System/currentTimeMillis))
@@ -98,17 +100,32 @@
 (defn launch-server!
   ([]
     (let [conf (read-storm-config)
-          service-handler (service-handler)     
-          options (-> (TNonblockingServerSocket. (int (conf DRPC-PORT)))
-                    (THsHaServer$Args.)
-                    (.workerThreads 64)
-                    (.protocolFactory (TBinaryProtocol$Factory.))
-                    (.processor (DistributedRPC$Processor. service-handler))
-                    )
-          server (THsHaServer. options)]
-      (.addShutdownHook (Runtime/getRuntime) (Thread. (fn [] (.stop server))))
-      (log-message "Starting Distributed RPC server...")
-      (.serve server))))
+          worker-threads (int (conf DRPC-WORKER-THREADS))
+          queue-size (int (conf DRPC-QUEUE-SIZE))
+          service-handler (service-handler)
+          ;; requests and returns need to be on separate thread pools, since calls to
+          ;; "execute" don't unblock until other thrift methods are called. So if 
+          ;; 64 threads are calling execute, the server won't accept the result
+          ;; invocations that will unblock those threads
+          handler-server (THsHaServer. (-> (TNonblockingServerSocket. (int (conf DRPC-PORT)))
+                                             (THsHaServer$Args.)
+                                             (.workerThreads 64)
+                                             (.executorService (ThreadPoolExecutor. worker-threads worker-threads 
+                                                                 60 TimeUnit/SECONDS (ArrayBlockingQueue. queue-size)))
+                                             (.protocolFactory (TBinaryProtocol$Factory.))
+                                             (.processor (DistributedRPC$Processor. service-handler))
+                                             ))
+          invoke-server (THsHaServer. (-> (TNonblockingServerSocket. (int (conf DRPC-INVOCATIONS-PORT)))
+                                             (THsHaServer$Args.)
+                                             (.workerThreads 64)
+                                             (.protocolFactory (TBinaryProtocol$Factory.))
+                                             (.processor (DistributedRPCInvocations$Processor. service-handler))
+                                             ))]
+      
+      (.addShutdownHook (Runtime/getRuntime) (Thread. (fn [] (.stop handler-server) (.stop invoke-server))))
+      (log-message "Starting Distributed RPC servers...")
+      (future (.serve invoke-server))
+      (.serve handler-server))))
 
 (defn -main []
   (launch-server!))

@@ -1,18 +1,19 @@
 package backtype.storm.testing;
 
+import backtype.storm.topology.base.BaseRichBolt;
 import backtype.storm.task.OutputCollector;
 import backtype.storm.topology.OutputFieldsDeclarer;
 import backtype.storm.tuple.Tuple;
 import backtype.storm.tuple.Fields;
 import java.util.Map;
 import backtype.storm.task.TopologyContext;
-import backtype.storm.topology.IRichBolt;
-import org.apache.log4j.Logger;
-import static backtype.storm.utils.Utils.tuple;
+import backtype.storm.tuple.Values;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 
-public class TestGlobalCount implements IRichBolt {
-    public static Logger LOG = Logger.getLogger(TestWordCounter.class);
+public class TestGlobalCount extends BaseRichBolt {
+    public static Logger LOG = LoggerFactory.getLogger(TestWordCounter.class);
 
     private int _count;
     OutputCollector _collector;
@@ -24,7 +25,7 @@ public class TestGlobalCount implements IRichBolt {
 
     public void execute(Tuple input) {
         _count++;
-        _collector.emit(tuple(_count));
+        _collector.emit(input, new Values(_count));
         _collector.ack(input);
     }
 
